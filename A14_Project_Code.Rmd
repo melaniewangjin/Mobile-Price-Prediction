@@ -1,0 +1,1527 @@
+---
+title: "Group Project Mobile Price Classification"
+author: "Group A14"
+date: "2022-12-10"
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 4
+  html_document: 
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+---
+Notes: 
+1.cleaned data: baked_train1, baked_test1
+2.set.seed(14)
+3.to tune hyperparameter, use cv accuracy，cv fold = 10.
+
+
+```{r}
+pacman::p_load(ggplot2,dplyr,caret,rsample,nnet,MASS,car,recipes,readr,class,DMwR2)
+```
+
+```{r eval=FALSE, include=FALSE}
+#data <- read.csv("train.csv")
+```
+
+```{r}
+data <- read.table('A14_Project_Data.txt', skip = 1, header =TRUE, sep ='\t')
+head(data)
+```
+
+
+```{r}
+str(data)
+dim(data)
+```
+
+# check missing value
+```{r}
+sum(is.na(data))
+```
+
+# change multiple price_range to binary price_range
+```{r}
+data$price <- as.integer(data$price_range>1)
+```
+
+```{r}
+data %>%
+  group_by(price_range,price) %>%
+  summarise(number = n(),.groups="drop") %>%
+  arrange(price_range)
+```
+# make a new data without price_range
+```{r}
+data1 <- data[,-21]
+str(data1)
+```
+
+# heat-map
+```{r}
+ggplot(data = data %>% select_if(is.numeric) %>% cor() %>% reshape2::melt(),
+        aes(x = Var1 ,y = Var2, fill = value)) +
+  geom_tile(color="white",size=0.1) +
+  xlab("") +
+  ylab("") +
+  guides(fill = guide_legend(data = "Correlation")) +
+  scale_fill_gradient( low = "#56B1F7", high = "#132B43") +     #lightblue to darkblue
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+```{r}
+#raw vs price_range
+data$price <- as.factor(data$price)
+ggplot(data=data, aes(x=price, y=ram)) + 
+geom_boxplot()
+```
+
+```{r}
+#battery_power vs price_range
+ggplot(data=data, aes(x=price, y=battery_power)) + 
+geom_boxplot()
+```
+## impute missing value : sc_w= 0
+```{r}
+data1[data1$sc_w==0,]$sc_w=NA
+data1=knnImputation(data1)
+```
+
+```{r}
+summary(data1)
+```
+#check if sc_w = 0 is imputed with other values
+#data1[13:14,]
+
+
+# stratified sampling 
+```{r}
+set.seed(14)
+split <- initial_split(data1,prop=0.8,strata = "price")
+train <- training(split)
+test <- testing(split)
+```
+
+# feature engineering
+as the data has already done the 0-1 variable, we should take care when do feature engineering
+```{r}
+blueprint <- recipe(price~.,data=train[,-c(2,4,6,18,19,20)]) %>% 
+  # don't change binary variables c(2,4,6,18,19,20).
+  step_nzv(all_nominal()) %>%
+  step_scale(all_numeric(),-all_outcomes()) %>%
+  step_center(all_numeric(),-all_outcomes()) %>%
+  step_dummy(all_nominal(),-all_outcomes(),one_hot = TRUE)
+```
+
+```{r}
+prepare <- prep(blueprint,training =train[,-c(2,4,6,18,19,20)])
+```
+
+```{r}
+baked_train <- bake(prepare,new_data = train[,-c(2,4,6,18,19,20)])
+baked_test <- bake(prepare,new_data = test[,-c(2,4,6,18,19,20)])
+```
+
+
+```{r}
+# combine baked data with original binary variables c(2,4,6,18,19,20)
+baked_train1 <- cbind(baked_train,train[,c(2,4,6,18,19,20)])
+baked_test1 <- cbind(baked_test,test[,c(2,4,6,18,19,20)])
+```
+
+```{r}
+#change all binary variables to factor for baked_train 
+#baked_train1[,15:21]
+baked_train1$price <- as.factor(baked_train1$price)
+baked_train1$blue <- as.factor(baked_train1$blue)
+baked_train1$dual_sim <- as.factor(baked_train1$dual_sim)
+baked_train1$four_g <- as.factor(baked_train1$four_g)
+baked_train1$three_g <- as.factor(baked_train1$three_g)
+baked_train1$touch_screen <- as.factor(baked_train1$touch_screen)
+baked_train1$wifi <- as.factor(baked_train1$wifi)
+head(baked_train1)
+```
+
+```{r}
+#change all binary variables to factor for test_train 
+baked_test1$price <- as.factor(baked_test1$price)
+baked_test1$blue <- as.factor(baked_test1$blue)
+baked_test1$dual_sim <- as.factor(baked_test1$dual_sim)
+baked_test1$four_g <- as.factor(baked_test1$four_g)
+baked_test1$three_g <- as.factor(baked_test1$three_g)
+baked_test1$touch_screen <- as.factor(baked_test1$touch_screen)
+baked_test1$wifi <- as.factor(baked_test1$wifi)
+head(baked_test1)
+```
+
+# logistic regression
+```{r warning = FALSE}
+fit_logit = glm(price~.,family = binomial(logit), baked_train1)
+summary(fit_logit)
+```
+```{r}
+p1_logit= vip::vip(fit_logit, num_feature = 20, scale = TRUE)
+gridExtra::grid.arrange(p1_logit, nrow = 1)
+```
+
+```{r warning = FALSE}
+library(car)
+Anova(fit_logit)
+```
+battery_power, mobile_wt, pc, px_height, px_width, ram are 6 siginificant variables.
+optimal model: price~battery_power+mobile_wt+pc+px_height+px_width+ram
+
+```{r}
+## pdp
+library(pdp)
+library(ggplot2)
+
+pdp_pred <- function(object, newdata){
+  pred_Obj <- ranger::predictions(predict(object, newdata))
+  results <- mean(as.vector(pred_Obj))
+  return(results)
+}
+
+pd_values1 <- partial(
+  fit_logit,
+  train = baked_train1,
+  pred.var = "ram",
+  grid.resolution = 20
+)
+
+pd_values2 <- partial(
+  fit_logit,
+  train = baked_train1,
+  pred.var = "battery_power",
+  grid.resolution = 20
+)
+
+autoplot(pd_values1, rug = TRUE, train = baked_train1)
+autoplot(pd_values2, rug = TRUE, train = baked_train1)
+```
+
+
+```{r warning = FALSE}
+fit_logit_final = glm(price~battery_power+mobile_wt+pc+px_height+px_width+ram,family = binomial(logit), baked_train1)
+summary(fit_logit_final)
+```
+
+```{r warning = FALSE}
+# do the cross validation
+#install.packages('boot')
+library(boot)
+set.seed(14)
+fit_logit_cv <- cv.glm(baked_train1,fit_logit_final, K=10) 
+fit_logit_cv$delta[1]
+```
+
+```{r}
+# the cv accuracy
+fit_logit_cv_accuracy <- 1- 0.005481233
+fit_logit_cv_accuracy
+```
+the accuracy in train data is 99.45%.
+
+```{r}
+# calculate the accuracy in train data
+pred_train1<-predict(fit_logit_final,newdata = baked_train1, type = "response")
+bio_train1<-ifelse(pred_train1>0.5,1,0)
+table(baked_train1$price,bio_train1)
+```
+```{r}
+accuracy_train1<-1-sum(bio_train1!=baked_train1$price)/1600
+accuracy_train1
+```
+the accuracy in train data is 99.44%.
+```{r}
+# calculate the accuracy in test data
+pred_test1<-predict(fit_logit_final,newdata = baked_test1, type = "response")
+bio_test1<-ifelse(pred_test1>0.5,1,0)
+table(baked_test1$price,bio_test1)
+```
+```{r}
+accuracy_test1<-1-sum(bio_test1!=baked_test1$price)/400
+accuracy_test1
+```
+the accuracy in test data is 98.25%.
+
+```{r}
+# final model result
+performance.log <- data.frame(
+  method = 'Logistic',
+  train_accuracy = accuracy_train1,
+  test_accuracy = accuracy_test1
+  )
+performance.log
+```
+
+# poly logistic regression
+
+```{r warning = FALSE}
+# we choose two features which have the biggest impact on the price to do the regression
+fit_poly1 <- glm(price ~ poly(battery_power,3) +poly(ram,3), data = baked_train1, family = binomial)
+summary(fit_poly1)
+```
+
+```{r}
+p1_poly= vip::vip(fit_poly1, num_feature = 20, scale = TRUE)
+gridExtra::grid.arrange(p1_poly, nrow = 1)
+```
+The final model is price ~ battery_power+ram+ram^2
+
+```{r}
+fit_poly_final = glm(price~battery_power+poly(ram,2),family = binomial(logit), baked_train1)
+summary(fit_poly_final)
+```
+
+```{r warning = FALSE}
+# do the cross validation
+library(boot)
+set.seed(14)
+fit_poly_cv <- cv.glm(baked_train1,fit_poly_final, K=10) 
+fit_poly_cv$delta[1]
+```
+```{r}
+# the cv accuracy
+fit_poly_cv_accuracy <- 1- 0.04526164
+fit_poly_cv_accuracy
+```
+the accuracy in train data is 95.47%.
+
+```{r}
+# calculate the accuracy in train data
+pred_train2<-predict(fit_poly_final,newdata = baked_train1, type = "response")
+bio_train2<-ifelse(pred_train2>0.5,1,0)
+table(baked_train1$price,bio_train2)
+```
+```{r}
+accuracy_train2<-1-sum(bio_train2!=baked_train1$price)/1600
+accuracy_train2
+```
+the accuracy in train data is 93.44%.
+
+```{r}
+# calculate the accuracy in test data
+pred_test2<-predict(fit_poly_final,newdata = baked_test1, type = "response")
+bio_test2<-ifelse(pred_test2>0.5,1,0)
+table(baked_test1$price,bio_test2)
+```
+```{r}
+accuracy_test2<-1-sum(bio_test2!=baked_test1$price)/400
+accuracy_test2
+```
+the accuracy in test data is 94%.
+```{r}
+# final model result
+performance.poly <- data.frame(
+  method = 'Polynomial Logistic',
+  train_accuracy = accuracy_train2,
+  test_accuracy = accuracy_test2
+  )
+performance.poly
+```
+
+# SVM
+```{r}
+#radial kernel
+library(e1071)
+set.seed(14)
+tune.out <- tune(svm,price~.,data = baked_train1,
+                 kernel="radial",
+                 ranges=list(
+                   cost=c(0.1,1,5,10,15,50,100),
+                   gamma=c(0.01,0.05,0.1,0.5,1,2)))
+summary(tune.out)
+```
+The best gamma is 0.01 and best cost is 5.
+
+```{r}
+fitsvm_radial<-svm(price~., 
+                   data = baked_train1, 
+                   kernel = "radial", 
+                   cost = 5, 
+                   gamma = 0.01)
+```
+
+
+```{r}
+set.seed(14)
+tune.out.poly<-tune(svm,price~.,data=baked_train1,
+                    kernel="polynomial",
+                    ranges=list(
+                      cost=c(0.1,1,10,50,100,150,180),
+                      degree=c(1,2,3,4,5)))
+summary(tune.out.poly)
+```
+The best degree is 1 and best cost is 50.
+
+```{r}
+fitsvm_poly<-svm(price~., 
+                 data = baked_train1, 
+                 kernel = "polynomial", 
+                 cost = 150, 
+                 degree = 1)
+```
+
+```{r}
+#svm training accuracy
+predsvmradial_train<-predict(fitsvm_radial, newdata = baked_train1 )
+table(true=baked_train1$price,pred=predsvmradial_train)
+```
+Radial Kernel Train Accuracy=(796+792)/1600=0.9925
+```{r}
+(svm_radial_train_accuracy <- sum(predsvmradial_train==baked_train1$price)/length(predsvmradial_train))
+```
+
+```{r}
+#svm testing accuracy
+predsvmradial_test<-predict(fitsvm_radial,newdata = baked_test1)
+table(true=baked_test1$price,pred=predsvmradial_test)
+```
+Radial Kernel Test Accuracy=(198+191)/400=0.9725
+```{r}
+(svm_radial_test_accuracy <- sum(predsvmradial_test==baked_test1$price)/length(predsvmradial_test))
+```
+
+```{r}
+#svm_poly training accuracy
+predsvmpoly_train<-predict(fitsvm_poly, newdata = baked_train1 )
+table(true=baked_train1$price,pred=predsvmpoly_train)
+```
+Polynomial Kernel Train Accuracy=(797+796)/1600=0.995625
+```{r}
+(svm_poly_train_accuracy <- sum(predsvmpoly_train==baked_train1$price)/length(predsvmpoly_train))
+```
+
+```{r}
+#svm_poly testing accuracy
+predsvmpoly_test<-predict(fitsvm_poly,newdata = baked_test1)
+table(true=baked_test1$price,pred=predsvmpoly_test)
+```
+Polynomial Kernel Test Accuracy=(196+194)/400=0.975
+```{r}
+(svm_poly_test_accuracy <- sum(predsvmpoly_test==baked_test1$price)/length(predsvmpoly_test))
+```
+
+
+```{r}
+# final model result
+performance.svm_r <- data.frame(
+  method = 'SVM Radial Kernel',
+  train_accuracy = svm_radial_train_accuracy,
+  test_accuracy = svm_radial_test_accuracy
+  )
+performance.svm_r
+```
+
+```{r}
+# final model result
+performance.svm_p <- data.frame(
+  method = 'SVM Polynomial Kernel',
+  train_accuracy = svm_poly_train_accuracy,
+  test_accuracy = svm_poly_test_accuracy
+  )
+performance.svm_p
+```
+
+# Tree Methods
+```{r}
+library(rpart)       # direct engine for decision tree application
+library(rpart.plot)  # for plotting decision trees
+```
+
+```{r}
+dt1 <- rpart(
+  formula=price~.,
+  data= baked_train1,
+  method="class"
+)
+rpart.plot(dt1)
+```
+```{r}
+## control max depth
+dt2<- rpart(
+  formula = price ~ .,
+  data    = baked_train1,
+  method  = "class",
+  control = list(maxdepth = 2)
+)
+rpart.plot(dt2)
+```
+```{r}
+## control min node size
+dt3 <- rpart(
+  formula = price ~ .,
+  data    = baked_train1,
+  method  = "class",
+  control = list(minbucket = round(0.1*nrow(baked_train1))) # at least 10%
+)
+rpart.plot(dt3)
+```
+```{r}
+## try to grow the whole tree
+dt4 <- rpart(
+  formula = price ~ .,
+  data    = baked_train1,
+  method  = "class",
+  control = list(minbucket=1) 
+)
+rpart.plot(dt4)
+```
+
+```{r}
+dt5 <- rpart(
+  formula = price ~ .,
+  data    = baked_train1,
+  method  = "class",
+  control = list(minbucket=1,cp=0) 
+)
+rpart.plot(dt5)
+```
+
+```{r}
+## get max depth of rpart tree
+nodes <- as.numeric(rownames(dt5$frame))
+max(rpart:::tree.depth(nodes))
+```
+
+# Random Forest
+```{r}
+library(h2o) # for resampling and model training
+# h2o set-up
+h2o.no_progress() # turn off h2o progress bars
+h2o.init() # launch h2o
+```
+
+```{r}
+library(ranger)
+# number of features
+n_features <- length(setdiff(names(baked_train1), "price"))
+# train a default random forest model
+rf1 <- ranger(
+price ~ .,
+data = baked_train1,
+mtry = NULL,
+splitrule = "gini",
+seed = 14
+)
+# get OOB RMSE
+(default_rmse <- sqrt(rf1$prediction.error))
+```
+
+```{r}
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+mtry = floor(n_features * c(.05, .15, .25, .333, .4)),
+min.node.size = c(1, 3, 5, 10, 20),
+replace = c(TRUE, FALSE),
+sample.fraction = c(.5, .63, .8),
+rmse = NA
+)
+```
+
+```{r}
+# execute full cartesian grid search
+for(i in seq_len(nrow(hyper_grid))) {
+# fit model for ith hyperparameter combination
+fit <- ranger(
+formula = price ~ .,
+data = baked_train1,
+num.trees = n_features * 10,
+mtry = hyper_grid$mtry[i],
+min.node.size = hyper_grid$min.node.size[i],
+replace = hyper_grid$replace[i],
+sample.fraction = hyper_grid$sample.fraction[i],
+verbose = FALSE,
+splitrule = "gini",
+seed = 14
+)
+# export OOB error
+hyper_grid$rmse[i] <- sqrt(fit$prediction.error)
+}
+```
+
+The best mtry is 8 and min.node.size is 3.
+```{r}
+# assess top 10 models
+hyper_grid %>%
+arrange(rmse) %>%
+mutate(perc_gain = (default_rmse - rmse) / default_rmse * 100) %>%
+head(10)
+```
+
+```{r}
+#h2o.no_progress()
+#h2o.init(max_mem_size = "5g")
+```
+
+```{r}
+# convert training data to h2o object
+train_h2o <- as.h2o(baked_train1)
+# set the response column to price
+response <- "price"
+# set the predictor names
+predictors <- setdiff(colnames(baked_train1), response)
+```
+
+```{r}
+h2o_rf1 <- h2o.randomForest(
+x = predictors,
+y = response,
+training_frame = train_h2o,
+ntrees = n_features * 10,
+seed = 14
+)
+h2o_rf1
+```
+```{r}
+# hyperparameter grid
+hyper_grid <- list(
+mtries = floor(n_features * c(.05, .15, .25, .333, .4)),
+min_rows = c(1, 3, 5, 10),
+max_depth = c(10, 20, 30),
+sample_rate = c(.55, .632, .70, .80)
+)
+# random grid search strategy
+search_criteria <- list(
+strategy = "RandomDiscrete",
+stopping_metric = "mse",
+stopping_tolerance = 0.001, # stop if improvement is < 0.1%
+stopping_rounds = 10 # over the last 10 models
+)
+```
+
+
+
+```{r}
+# perform grid search
+random_grid <- h2o.grid(
+algorithm = "randomForest",
+grid_id = "rf_random_grid",
+x = predictors,
+y = response,
+training_frame = train_h2o,
+hyper_params = hyper_grid,
+ntrees = n_features * 10,
+seed = 14,
+stopping_metric = "RMSE",
+stopping_rounds = 10, # stop if last 10 trees added
+stopping_tolerance = 0.005,# don’t improve RMSE by 0.5%
+search_criteria = search_criteria
+)
+```
+
+The best max_depth is 20, min.rows is 1 , and mtry is 8.
+```{r}
+random_grid_perf <- h2o.getGrid(
+grid_id = "rf_random_grid",
+sort_by = "mse",
+decreasing = FALSE
+)
+random_grid_perf
+```
+```{r}
+# re-run model with impurity-based variable importance
+rf_impurity <- ranger(
+formula = price ~ .,
+data = baked_train1,
+num.trees = 20,
+mtry = 8,
+min.node.size = 1,
+sample.fraction = .80,
+replace = FALSE,
+importance = "impurity",
+verbose = FALSE,
+splitrule = "gini",
+seed = 14
+)
+# re-run model with permutation-based variable importance
+rf_permutation <- ranger(
+formula = price ~ .,
+data = baked_train1,
+num.trees = 20,
+mtry = 8,
+min.node.size = 1,
+sample.fraction = .80,
+replace = FALSE,
+importance = "permutation",
+verbose = FALSE,
+splitrule = "gini",
+seed = 14
+)
+```
+
+```{r}
+library(vip)
+p1 <- vip::vip(rf_impurity, num_features = 20, bar = FALSE)
+p2 <- vip::vip(rf_permutation, num_features = 20, bar = FALSE)
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+
+```{r}
+predrfimpurity_train<-predict(rf_impurity, baked_train1 )
+table(true=baked_train1$price,pred=predrfimpurity_train$predictions)
+```
+Random Forest impurity Train Accuracy=100%
+```{r}
+rf_train_accurarcy<- sum(baked_train1$price==predrfimpurity_train$predictions)/length(baked_train1$price)
+rf_train_accurarcy
+```
+
+
+```{r}
+predrfimpurity_test<-predict(rf_impurity, baked_test1 )
+table(true=baked_test1$price,pred=predrfimpurity_test$predictions)
+```
+Random Forest impurity Train Accuracy=(194+191)/400=96.25%
+```{r}
+rf_test_accurarcy<- sum(baked_test1$price==predrfimpurity_test$predictions)/length(baked_test1$price)
+rf_test_accurarcy
+```
+
+```{r}
+predrfpermutation_train<-predict(rf_permutation, data = baked_train1,type="response")
+table(true=baked_train1$price,pred=predrfpermutation_train$predictions)
+```
+Random Forest permutation Train Accuracy=100%
+
+```{r}
+predrfpermutation_test<-predict(rf_permutation, baked_test1 )
+table(true=baked_test1$price,pred=predrfpermutation_test$predictions)
+```
+```{r}
+# final model result
+performance.rf <- data.frame(
+  method = 'Random Forest',
+  train_accuracy = rf_train_accurarcy,
+  test_accuracy = rf_test_accurarcy
+  )
+performance.rf
+```
+```{r}
+#h2o.shutdown(prompt = FALSE)
+```
+
+# GMB 
+```{r include=FALSE}
+#library(h2o)
+#h2o.init(nthreads = -1) 
+```
+
+```{r}
+# column names of x and y 
+y <- "price"
+
+# Identify the predictor columns
+x <- setdiff(names(baked_train1), y)
+```
+
+
+```{r}
+# Convert response to factor
+baked_train1[,y] <- as.factor(baked_train1[,y])
+#test[,y] <- as.factor(test[,y])
+
+# convert train and test data frames to h2o objects
+train.h2o <- as.h2o(baked_train1)
+```
+```{r}
+# test data 
+# Convert response to factor
+baked_test1[,y] <- as.factor(baked_test1[,y])
+#test[,y] <- as.factor(test[,y])
+
+# convert train and test data frames to h2o objects
+test.h2o <- as.h2o(baked_test1)
+```
+
+```{r eval=FALSE, include=FALSE}
+fit.gbm <- h2o.gbm(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  ntrees = 500,
+  learn_rate = 0.1,
+  nfolds = 10,
+  max_depth = 5,
+  sample_rate = 1.0,
+  col_sample_rate_per_tree = 0.5,
+  distribution = "bernoulli",
+  stopping_rounds = 50,
+  score_each_iteration = TRUE,
+  stopping_metric ="misclassification",
+  stopping_tolerance = 0,
+  seed = 14
+  )
+```
+
+```{r eval=FALSE, include=FALSE}
+show(fit.gbm)
+```
+
+```{r eval=FALSE, include=FALSE}
+gbm_s <- summary(fit.gbm)
+```
+
+# step1 tune learning rate
+```{r}
+# defined hyperparameter grid
+hyper_grid_lr <- list(
+  learn_rate = c(0.3,0.1, 0.05, 0.01, 0.005)             
+)
+```
+
+```{r}
+# perform grid search 
+grid <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_lr_grid",
+  x = x, 
+  y = y,
+  training_frame = train.h2o,
+  hyper_params = hyper_grid_lr,
+  ntrees = 500,
+  max_depth = 5,
+  min_rows = 5,
+  nfolds = 10,
+  distribution = "bernoulli",
+  stopping_rounds = 50,
+  score_each_iteration = TRUE,
+  stopping_metric ="misclassification",
+  stopping_tolerance = 0,
+  seed = 14
+)
+```
+
+```{r}
+# collect the results and sort by our model performance metric of choice
+lr_grid_perf <- h2o.getGrid(
+  grid_id = "gbm_lr_grid", 
+  sort_by = "accuracy", 
+  decreasing = TRUE
+)
+```
+
+```{r}
+lr_grid_perf
+```
+
+
+```{r}
+# get best learning rate
+best_learning_rate <- lr_grid_perf@summary_table[1,1]
+tune_shrinkage_result <- lr_grid_perf@summary_table[1,3]
+best_learning_rate
+```
+
+# check how many trees does learning rate = 0.1 need 
+```{r}
+fit.gbm <- h2o.gbm(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  ntrees = 500,
+  learn_rate = best_learning_rate,
+  nfolds = 10,
+  max_depth = 5,
+  sample_rate = 1.0,
+  col_sample_rate_per_tree = 0.5,
+  distribution = "bernoulli",
+  stopping_rounds = 50,
+  score_each_iteration = TRUE,
+  stopping_metric ="misclassification",
+  stopping_tolerance = 0,
+  seed = 14
+  )
+```
+```{r}
+show(fit.gbm)
+```
+197 trees 
+
+# step2 using best learning rate to tune tree-based methods hyperparameters
+```{r}
+# defined hyperparameter grid
+hyper_grid_tree <- list(
+  ntrees = c(50,100,300),
+  max_depth = c(5,15,20),
+  min_rows = c(5,15,20)
+)
+```
+
+```{r}
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "misclassification",
+  stopping_rounds = 20,         
+  max_runtime_secs = 60*60      
+)
+```
+
+```{r}
+# perform grid search 
+grid2 <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_tree_grid",
+  x = x, 
+  y = y,
+  training_frame = train.h2o,
+  learn_rate = best_learning_rate,  ### use best learning rate
+  hyper_params = hyper_grid_tree,
+  nfolds = 10,
+  distribution = "bernoulli",
+  search_criteria = search_criteria,
+  seed = 14
+)
+```
+
+```{r}
+# collect the results and sort by our model performance metric of choice
+tree_grid_perf <- h2o.getGrid(
+  grid_id = "gbm_tree_grid", 
+  sort_by = "accuracy", 
+  decreasing = TRUE
+)
+```
+
+```{r}
+tree_grid_perf@summary_table
+```
+```{r}
+# get best parameters
+best_max_depth <- tree_grid_perf@summary_table[1,1]
+best_min_rows <- tree_grid_perf@summary_table[1,2]
+best_ntress <- tree_grid_perf@summary_table[1,3]
+tune_tree_result <- tree_grid_perf@summary_table[1,5]
+```
+
+# step3 use basic gbm hyperparameters tune stochastic hyperparameters
+```{r}
+# refined hyperparameter grid
+hyper_grid_stochastic <- list(
+  sample_rate = c(0.5, 0.75, 1),              # row subsampling
+  col_sample_rate = c(0.5, 0.75, 1),          # col subsampling for each split
+  col_sample_rate_per_tree = c(0.5, 0.75, 1)  # col subsampling for each tree
+)
+```
+
+
+```{r}
+# perform grid search 
+grid3 <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "stochastic_grid",
+  x = x, 
+  y = y,
+  training_frame = train.h2o,
+  hyper_params = hyper_grid_stochastic,
+  ntrees = best_ntress,
+  learn_rate = best_learning_rate,
+  max_depth = best_max_depth,
+  min_rows = best_min_rows,
+  nfolds = 10,
+  distribution = "bernoulli",
+  search_criteria = search_criteria,
+  seed = 14
+)
+```
+
+```{r}
+# collect the results and sort by our model performance metric of choice
+stochastic_grid_perf <- h2o.getGrid(
+  grid_id = "stochastic_grid", 
+  sort_by = "accuracy", 
+  decreasing = TRUE
+)
+```
+
+```{r}
+stochastic_grid_perf@summary_table
+```
+
+
+```{r}
+# get best parameters
+best_col_sample_rate <- stochastic_grid_perf@summary_table[1,1]
+best_col_sample_rate_per_tree <- stochastic_grid_perf@summary_table[1,2]
+best_sample_rate <- stochastic_grid_perf@summary_table[1,3]
+tune_stochastic_result <- stochastic_grid_perf@summary_table[1,5]
+```
+
+# summarize tune result
+```{r}
+gbm_tune_result <- data.frame(
+  tuned_hyperparamters = c('Shrinkage','Tree-based','Stochastic'),
+  best_cv_accuracy = c(tune_shrinkage_result,tune_tree_result,tune_stochastic_result)
+  )
+gbm_tune_result$tuned_hyperparamters <- factor(gbm_tune_result$tuned_hyperparamters,levels = c('Shrinkage','Tree-based','Stochastic'))
+gbm_tune_result
+```
+
+
+```{r}
+ggplot(data = gbm_tune_result, aes(x = tuned_hyperparamters, y = best_cv_accuracy)) +
+         #geom_bar(stat="identity") +
+         geom_col(width = 0.5) + 
+         geom_text(aes(label = best_cv_accuracy), vjust = 0) +
+         coord_cartesian(ylim=c(0.95,1))
+```
+
+
+
+```{r}
+# final model using best parameters
+fit.gbm <- h2o.gbm(
+  x = x,
+  y = y,
+  training_frame = train.h2o,
+  validation_frame = test.h2o,
+  learn_rate = best_learning_rate,
+  max_depth = best_max_depth,
+  min_rows = best_min_rows,
+  ntrees = best_ntress,
+  sample_rate = best_sample_rate,
+  col_sample_rate_per_tree = best_col_sample_rate_per_tree,
+  col_sample_rate = best_col_sample_rate,
+  distribution = "bernoulli",
+  stopping_rounds = 20,
+  score_each_iteration = TRUE,
+  stopping_metric ="misclassification",
+  stopping_tolerance = 0,
+  seed = 14
+  )
+```
+
+# train data performance
+```{r}
+gbm_train_performance <-h2o.confusionMatrix(fit.gbm,metric="accuracy")
+gbm_train_performance
+```
+
+
+```{r}
+gbm_train_accuracy = 1- gbm_train_performance[3,3]
+gbm_train_accuracy
+```
+
+# test data performance 
+```{r}
+gbm_test_performance <- h2o.confusionMatrix(fit.gbm,valid=TRUE,metric ="accuracy")
+gbm_test_performance
+```
+```{r}
+gbm_test_accuracy = 1- gbm_test_performance[3,3]
+gbm_test_accuracy
+```
+
+```{r}
+# final model performance
+performance.gbm <- data.frame(
+  method = 'GBM',
+  train_accuracy = gbm_train_accuracy,
+  test_accuracy = gbm_test_accuracy 
+  )
+```
+
+```{r}
+performance.gbm
+```
+
+```{r}
+# Create custom predict function that returns the predicted values as a vector
+pred <- function(object, newdata)  {
+  results <- as.vector(h2o.predict(object, as.h2o(newdata)))
+  return(results)
+}
+```
+
+
+```{r}
+library(vip)
+vip(
+  fit.gbm,
+  train = as.data.frame(train.h2o),
+  method = "permute",
+  target = "price",
+  metric = "accuracy",
+  pred_wrapper = pred,
+  scale = TRUE 
+)
+```
+
+```{r}
+# Custom prediction function wrapper
+pdp_pred <- function(object, newdata)  {
+  results <- mean(as.vector(h2o.predict(object,as.h2o(newdata))$p1))
+  return(results)
+}
+```
+
+```{r include=FALSE}
+# Compute partial dependence values
+pd_values_ram <- pdp::partial(
+  fit.gbm,
+  train = as.data.frame(train.h2o), 
+  pred.var = "ram",
+  pred.fun = pdp_pred,
+  grid.resolution = 20
+)
+```
+```{r include=FALSE}
+# Compute partial dependence values
+pd_values_bat <- pdp::partial(
+  fit.gbm,
+  train = as.data.frame(train.h2o), 
+  pred.var = "battery_power",
+  pred.fun = pdp_pred,
+  grid.resolution = 20
+)
+```
+
+```{r}
+grid.arrange(
+  autoplot(pd_values_ram, rug = TRUE, train = as.data.frame(train.h2o)),
+  autoplot(pd_values_bat, rug = TRUE, train = as.data.frame(train.h2o)),
+  ncol =2
+)
+```
+
+
+# xgboost
+
+```{r}
+library(xgboost)
+library(Matrix)
+```
+
+```{r}
+y <- "price"
+train.mx <- sparse.model.matrix(price ~ ., baked_train1)[,-1] 
+test.mx <- sparse.model.matrix(price ~ ., baked_test1)[,-1]
+dtrain <- xgb.DMatrix(train.mx, label = as.integer(baked_train1[,y])-1)
+dtest <- xgb.DMatrix(test.mx, label = as.integer(baked_test1[,y])-1)
+```
+
+
+```{r}
+#start_time = Sys.time()
+#start_time 
+set.seed(14)
+system.time(mobile.xgb <- xgb.cv(
+  data = dtrain,
+  #label = getinfo(dtrain, 'label'),
+  metrics = c('error'),
+  nrounds = 300,
+  objective = "binary:logistic",
+  early_stopping_rounds = 50, 
+  nfold = 10,
+  params = list(
+    eta = 0.1,
+    max_depth = 5,
+    min_child_weight = 15,
+    subsample = 0.75,
+    colsample_bytree = 1),
+  verbose = 0
+))
+
+# maximize test CV accuracy
+(default_accuracy_xgb <- 1-min(mobile.xgb$evaluation_log$test_error_mean))
+```
+
+
+```{r}
+mobile.xgb$best_iteration
+```
+
+1. learning rate
+```{r}
+hyper_grid_eta <- expand.grid(
+  eta = c(0.3,0.1, 0.05, 0.005), # typical 0.001-0.3
+  accuracy = 0,          # a place to dump accuracy results
+  trees = 0,          # a place to dump required number of trees
+  time = 0
+)
+```
+
+```{r}
+# grid search  
+start_time = Sys.time()
+start_time 
+
+for(i in seq_len(nrow(hyper_grid_eta))) {
+  set.seed(14)
+  train_time <- system.time({m <- xgb.cv(
+    data = dtrain,
+    #label = Y,
+    nrounds = 1000,
+    objective = "binary:logistic",
+    early_stopping_rounds = 50, 
+    metrics = c('error'),
+    nfold = 10,
+    verbose = 0,
+    eta = hyper_grid_eta$eta[i]
+  )})
+  
+  hyper_grid_eta$accuracy[i] <- 1- min(m$evaluation_log$test_error_mean)
+  hyper_grid_eta$trees[i] <- m$best_iteration
+  hyper_grid_eta$time[i]  <- train_time[["elapsed"]]
+}
+```
+```{r}
+#assess models
+hyper_grid_eta %>%
+  arrange(desc(accuracy)) %>%
+  mutate(perc_gain = (accuracy-default_accuracy_xgb)/default_accuracy_xgb*100)
+```
+
+```{r}
+#best performance
+best_accuracy_eta <- max(hyper_grid_eta$accuracy)
+best_accuracy_eta
+```
+
+2. tune tree-specific hyperparameters
+```{r}
+hyper_grid_tree_xgb <- expand.grid(
+  eta = 0.3,
+  max_depth = c(3,5,6,8,15), # typical 3-8
+  min_child_weight = c(1,5,10,15), # typical 5-15
+  accuracy = 0,          # a place to dump accuracy results
+  trees = 0,          # a place to dump required number of trees
+  time = 0
+)
+```
+
+```{r}
+# grid search  # total 252 combinations # 4 min
+start_time = Sys.time()
+start_time 
+
+for(i in seq_len(nrow(hyper_grid_tree_xgb))) {
+  set.seed(14)
+  train_time <- system.time({m <- xgb.cv(
+    data = dtrain,
+    #label = Y,
+    nrounds = 300,
+    objective = "binary:logistic",
+    early_stopping_rounds = 50, 
+    metrics = c('error'),
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = hyper_grid_tree_xgb$eta[i], 
+      max_depth = hyper_grid_tree_xgb$max_depth[i],
+      min_child_weight = hyper_grid_tree_xgb$min_child_weight[i]
+    ) 
+  )})
+  
+  hyper_grid_tree_xgb$accuracy[i] <- 1- min(m$evaluation_log$test_error_mean)
+  hyper_grid_tree_xgb$trees[i] <- m$best_iteration
+  hyper_grid_tree_xgb$time[i]  <- train_time[["elapsed"]]
+}
+```
+
+```{r}
+#assess models
+hyper_grid_tree_xgb %>%
+  arrange(desc(accuracy)) %>%
+  mutate(perc_gain = (accuracy-default_accuracy_xgb)/default_accuracy_xgb*100)
+```
+it seems that when min_child_weight = 1, the accuracy is the highest, not very sensitive to max_depth
+
+```{r}
+#best performance
+best_accuracy_tree <- max(hyper_grid_tree_xgb$accuracy)
+best_accuracy_tree
+```
+
+3. Explore stochastic GBM attributes.
+```{r}
+hyper_grid_stoch_xgb <- expand.grid(
+  eta = 0.3,
+  max_depth = 5, 
+  min_child_weight = 1,
+  subsample = c(0.5,0.75,1),
+  colsample_bytree = c(0.5,0.75,1),
+  accuracy = 0,          # a place to dump accuracy results
+  trees = 0,          # a place to dump required number of trees
+  time = 0
+)
+```
+
+```{r}
+# grid search  # total 252 combinations #  4 min
+start_time = Sys.time()
+start_time 
+
+for(i in seq_len(nrow(hyper_grid_stoch_xgb))) {
+  set.seed(14)
+  train_time <- system.time({m <- xgb.cv(
+    data = dtrain,
+    #label = Y,
+    nrounds = 300,
+    objective = "binary:logistic",
+    early_stopping_rounds = 50, 
+    metrics = c('error'),
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = hyper_grid_stoch_xgb$eta[i], 
+      max_depth = hyper_grid_stoch_xgb$max_depth[i],
+      min_child_weight = hyper_grid_stoch_xgb$min_child_weight[i],
+      subsample = hyper_grid_stoch_xgb$subsample[i],
+      colsample_bytree = hyper_grid_stoch_xgb$colsample_bytree[i]
+    ) 
+  )})
+  
+  hyper_grid_stoch_xgb$accuracy[i] <- 1- min(m$evaluation_log$test_error_mean)
+  hyper_grid_stoch_xgb$trees[i] <- m$best_iteration
+  hyper_grid_stoch_xgb$time[i]  <- train_time[["elapsed"]]
+}
+```
+
+```{r}
+#assess models
+hyper_grid_stoch_xgb %>%
+  arrange(desc(accuracy)) %>%
+  mutate(perc_gain = (accuracy-default_accuracy_xgb)/default_accuracy_xgb*100)
+```
+
+```{r}
+#best performance
+best_accuracy_stoch <- max(hyper_grid_stoch_xgb$accuracy)
+best_accuracy_stoch
+```
+final model 
+```{r}
+set.seed(14)
+fit.xgb1 <- xgboost(
+  data = dtrain,
+  nrounds = 35,
+  eta = 0.3,
+  max_depth = 5, 
+  min_child_weight = 1,
+  #subsample=0.75,
+  #colsample_bytree=1,
+  objective = "binary:logistic",
+  verbose = 0
+)
+```
+
+
+```{r}
+train_pred <- predict(fit.xgb1, dtrain)
+train_class <- as.integer(train_pred > 0.5)
+xgb_train_accuracy1 <- sum(train_class==getinfo(dtrain, 'label'))/length(train_class)
+xgb_train_accuracy1
+```
+
+```{r}
+test_pred <- predict(fit.xgb1, dtest)
+test_class <- as.integer(test_pred > 0.5)
+xgb_test_accuracy1 <- sum(test_class==getinfo(dtest, 'label'))/length(test_class)
+xgb_test_accuracy1
+```
+
+Above the result without examing the three regularization parmaters : gamma, lambda, and alpha.
+```{r}
+# hyperparameter grid 
+hyper_grid_xgb <- expand.grid(
+  eta = 0.3,
+  max_depth = 5, 
+  min_child_weight = 1,
+  #subsample=0.75,
+  #colsample_bytree=1,
+  gamma = c(0, 1e-2, 0.1, 1, 10, 100, 1000),
+  lambda = c(0, 1e-2, 0.1, 1, 100, 1000),
+  alpha = c(0, 1e-2, 0.1, 1, 100, 1000),
+  accuracy = 0,          # a place to dump accuracy results
+  trees = 0,          # a place to dump required number of trees
+  time = 0
+)
+```
+
+
+```{r}
+# grid search  # total 252 combinations #  8 min
+start_time = Sys.time()
+start_time 
+
+for(i in seq_len(nrow(hyper_grid_xgb))) {
+  set.seed(14)
+  train_time <- system.time({m <- xgb.cv(
+    data = dtrain,
+    #label = Y,
+    nrounds = 300,
+    objective = "binary:logistic",
+    early_stopping_rounds = 50, 
+    metrics = c('error'),
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = hyper_grid_xgb$eta[i], 
+      max_depth = hyper_grid_xgb$max_depth[i],
+      min_child_weight = hyper_grid_xgb$min_child_weight[i],
+      gamma = hyper_grid_xgb$gamma[i], 
+      lambda = hyper_grid_xgb$lambda[i], 
+      alpha = hyper_grid_xgb$alpha[i]
+    ) 
+  )})
+  
+  hyper_grid_xgb$accuracy[i] <- 1- min(m$evaluation_log$test_error_mean)
+  hyper_grid_xgb$trees[i] <- m$best_iteration
+  hyper_grid_xgb$time[i]  <- train_time[["elapsed"]]
+}
+```
+
+
+
+```{r}
+#assess top 10 models
+hyper_grid_xgb %>%
+  arrange(desc(accuracy)) %>%
+  mutate(perc_gain = (accuracy-default_accuracy_xgb)/default_accuracy_xgb*100) %>%
+  head(20)
+```
+
+```{r}
+#best performance
+best_accuracy_regul <- max(hyper_grid_xgb$accuracy)
+best_accuracy_regul
+```
+
+# summarize tune result
+```{r}
+xgb_tune_result <- data.frame(
+  tuned_hyperparamters = c('Shrinkage','Tree-based','Stochastic','Regularization'),
+  best_cv_accuracy = c(best_accuracy_eta,best_accuracy_tree,best_accuracy_stoch,best_accuracy_regul)
+  )
+xgb_tune_result$tuned_hyperparamters <- factor(xgb_tune_result$tuned_hyperparamters,levels = c('Shrinkage','Tree-based','Stochastic','Regularization'))
+xgb_tune_result
+```
+
+```{r}
+ggplot(data = xgb_tune_result, aes(x = tuned_hyperparamters, y = best_cv_accuracy)) +
+         #geom_bar(stat="identity") +
+         geom_col(width = 0.5) + 
+         geom_text(aes(label = best_cv_accuracy), vjust = 0) +
+         coord_cartesian(ylim=c(0.97,0.99))
+```
+```{r}
+set.seed(14)
+fit.xgb2 <- xgboost(
+  data = dtrain,
+  nrounds = 64,
+  eta = 0.3,
+  max_depth = 5, 
+  min_child_weight = 1,
+  gamma = 0,
+  lambda =1, 
+  alpha = 0.01,
+  objective = "binary:logistic",
+  verbose = 0
+)
+```
+
+```{r}
+train_pred <- predict(fit.xgb2, dtrain)
+train_class <- as.integer(train_pred > 0.5)
+xgb_train_accurarcy2 <- sum(train_class==getinfo(dtrain, 'label'))/length(train_class)
+xgb_train_accurarcy2
+```
+
+```{r}
+test_pred <- predict(fit.xgb2, dtest)
+test_class <- as.integer(test_pred > 0.5)
+xgb_test_accurarcy2 <- sum(test_class==getinfo(dtest, 'label'))/length(test_class)
+xgb_test_accurarcy2
+```
+
+
+## four important predictors
+```{r}
+vip::vip(fit.xgb2,scale=TRUE)
+```
+
+## pdp plots
+```{r}
+# Custom prediction function wrapper
+xgb_pred <- function(object, newdata)  {
+  results <- mean(as.vector(predict(object, newdata)))
+  return(results)
+}
+```
+
+```{r}
+# Compute partial dependence values
+xgb_values_ram <- pdp::partial(
+  fit.xgb2,
+  train = train.mx,
+  pred.var = "ram",
+  pred.fun = xgb_pred,
+  grid.resolution = 20
+)
+```
+
+```{r}
+# Compute partial dependence values
+xgb_values_bat <- pdp::partial(
+  fit.xgb2,
+  train = train.mx,
+  pred.var = "battery_power",
+  pred.fun = xgb_pred,
+  grid.resolution = 20
+)
+```
+
+
+```{r}
+vip::grid.arrange(
+  autoplot(xgb_values_ram, rug = TRUE, train = train.mx),
+  autoplot(xgb_values_bat, rug = TRUE, train = train.mx),
+  ncol=2
+)
+```
+
+```{r}
+# final model result
+performance.xgb <- data.frame(
+  method = 'XGBoost',
+  train_accuracy = xgb_train_accuracy1,
+  test_accuracy = xgb_test_accuracy1
+  )
+performance.xgb
+```
+
+
+```{r}
+comparasion <- rbind(performance.log,performance.poly,performance.rf,performance.svm_p,performance.svm_r,performance.gbm,performance.xgb)
+comparasion$method <- factor(comparasion$method ,levels = c('Logistic','Polynomial Logistic','Random Forest','SVM Polynomial Kernel','SVM Radial Kernel','GBM','XGBoost'))
+comparasion
+```
+
+```{r}
+library(reshape2)
+cp <- melt(comparasion, id.vars='method')
+#cp$value <- scales::percent(cp$value, 0.01)
+```
+
+```{r}
+ggplot(data = cp, aes(x = method, y = value,fill=variable)) +
+         geom_bar(stat='identity', position='dodge')+
+         #scale_fill_grey() +
+         scale_fill_manual(values=c('grey','orange'))+ #'#DF8344'
+         #,fill=c('grey','orange')
+         # geom_text(aes(label = round(value,4)),vjust = 0.5) +
+         theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+         coord_cartesian(ylim=c(0.93,1))
+```
+
+```{r}
+# good practice to shut down h2o environment
+h2o.shutdown(prompt = FALSE)
+```
