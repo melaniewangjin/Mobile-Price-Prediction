@@ -1,6 +1,6 @@
 ---
-title: "Group Project Mobile Price Classification"
-author: "Group A14"
+title: "Mobile Price Classification"
+author: "Wang Jin"
 date: "2022-12-10"
 output:
   pdf_document: 
